@@ -89,3 +89,6 @@ pipeline 不变。
 [2026-05-22 22:22]
 Hello, this is the Benchmarks Advanced Computing for Local AI, which is the generation at 27 billion of 2B models. This cycle is mentioned even better.
 
+[2026-05-22 22:39]
+So now I open the connectivity monitor so I can see the physical memory used, cached files, so abused, and with memory complex. So I want to know which model is occupied the memory.
+
