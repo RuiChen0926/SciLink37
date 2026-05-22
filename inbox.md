@@ -92,3 +92,23 @@ Hello, this is the Benchmarks Advanced Computing for Local AI, which is the gene
 [2026-05-22 22:39]
 So now I open the connectivity monitor so I can see the physical memory used, cached files, so abused, and with memory complex. So I want to know which model is occupied the memory.
 
+[2026-05-22 22:54]
+[链接] Genesis Mission
+https://genesis.energy.gov/
+A National Initiative to Accelerate Science Through AI. Genesis Mission is a national initiative to build the world's most powerful scientific platform to accelerate discovery science, strengthen national security, and drive energy innovation.
+
+[2026-05-22 22:55]
+[链接] Build with Gemini XPRIZE: $2,000,000 in prizes. Build with Gemini. Ship products that impact the world. - Devpost
+https://xprize.devpost.com/?_gl=1*qk7bsc*_gcl_au*ODA1MDcxMDYyLjE3NzkzNTM0NDY.*_ga*MTM2NzM5NzA0OC4xNzc5MzUzNDQ3*_ga_0YHJK3Y10M*czE3NzkzNTM0NDYkbzEkZzEkdDE3NzkzNTM3OTYkajEzJGwwJGgw
+$2,000,000 in prizes. Build with Gemini. Ship products that impact the world.
+
+[2026-05-22 23:09]
+[链接] Towards an AI co-scientist
+https://arxiv.org/abs/2502.18864
+Scientific discovery relies on scientists generating novel hypotheses that undergo rigorous experimental validation. To augment this process, we introduce an AI co-scientist, a multi-agent system built on Gemini 2.0. The AI co-scientist is intended to help uncover new, original knowledge and to formulate demonstrably novel research hypotheses and proposals, building upon prior evidence and aligned to scientist-provided research objectives and guidance. The system's design incorporates a generate, debate, and evolve approach to hypothesis generation, inspired by the scientific method and accelerated by scaling test-time compute. Key contributions include: (1) a multi-agent architecture with an asynchronous task execution framework for flexible compute scaling; (2) a tournament evolution process for self-improving hypotheses generation. Automated evaluations show continued benefits of test-time compute, improving hypothesis quality. While general purpose, we focus development and validation in three biomedical areas: drug repurposing, novel target discovery, and explaining mechanisms of bacterial evolution and anti-microbial resistance. For drug repurposing, the system proposes candidates with promising validation findings, including candidates for acute myeloid leukemia that show tumor inhibition in vitro at clinically applicable concentrations. For novel target discovery, the AI co-scientist proposed new epigenetic targets for liver fibrosis, validated by anti-fibrotic activity and liver cell regeneration in human hepatic organoids. Finally, the AI co-scientist recapitulated unpublished experimental results via a parallel in silico discovery of a novel gene transfer mechanism in bacterial evolution. These results, detailed in separate, co-timed reports, demonstrate the potential to augment biomedical and scientific discovery and usher an era of AI empowered scientists.
+
+[2026-05-22 23:11]
+[链接] Science — Google DeepMind
+https://deepmind.google/science/
+Helping power the next century of scientific progress. We take a multidisciplinary approach to connect different fields of scientific study. To support researchers as they work towards new breakthrou…
+

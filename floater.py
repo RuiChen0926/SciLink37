@@ -8,12 +8,14 @@ Enter 保存到 inbox.md，Esc / 失焦取消。
 全局热键基于 CGEventTap (kCGSessionEventTap + kCGHeadInsertEventTap)，
 监听 flagsChanged 检测 Command 的「干净双击」——两次按下间隔 < 0.4s，且中间没有其他键。"""
 import os
+import subprocess
 import tempfile
 import threading
 import time
 import wave
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import objc
 from AppKit import (
@@ -114,6 +116,17 @@ except Exception as _exc:  # noqa: BLE001
     _WHISPER_AVAILABLE = False
     print(f"[floater] mlx_whisper 未安装: {_exc}（pip install mlx-whisper）", flush=True)
 
+# URL 抓取相关依赖：缺失时降级，剪贴板 URL 还是会原样填入
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    _URL_FETCH_AVAILABLE = True
+except Exception as _exc:  # noqa: BLE001
+    requests = None  # type: ignore[assignment]
+    BeautifulSoup = None  # type: ignore[assignment]
+    _URL_FETCH_AVAILABLE = False
+    print(f"[floater] URL 抓取依赖缺失: {_exc}（pip install requests beautifulsoup4）", flush=True)
+
 
 INBOX = Path("/Users/rui/Projects/SciLink37/inbox.md")
 WIDTH = 400.0
@@ -136,6 +149,36 @@ NS_COMPOSITE_SOURCE_OVER = 2
 NS_IMAGE_ONLY = 1  # NSCellImagePosition.imageOnly
 WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
 WHISPER_SAMPLE_RATE = 16000
+URL_FETCH_TIMEOUT = 8
+URL_FETCH_PLACEHOLDER = "正在抓取..."
+URL_FETCH_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+# 备用 UA：L2 抓取失败时重试一次，许多反爬只针对某个浏览器指纹
+URL_FETCH_UA_ALT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) "
+    "Gecko/20100101 Firefox/124.0"
+)
+URL_BODY_FOR_LLM = 500
+# 第一层：站点专用规则
+ARXIV_DOMAINS = ("arxiv.org",)
+GITHUB_DOMAINS = ("github.com",)
+YOUTUBE_DOMAINS = ("youtube.com", "youtu.be")
+# 其他学术 / 新闻站：优先吃 og:description
+OG_PREFERRED_DOMAINS = (
+    "nature.com", "science.org", "sciencedaily.com", "phys.org",
+    "nytimes.com", "theguardian.com", "bbc.com", "bbc.co.uk",
+    "reuters.com", "bloomberg.com", "ft.com", "wsj.com",
+    "economist.com", "medium.com", "substack.com",
+    "techcrunch.com", "theverge.com", "arstechnica.com",
+)
+# 第三层：按需 Gemma 兜底
+GEMMA_HEALTH_URL = "http://localhost:8080/v1/models"
+GEMMA_CHAT_URL = "http://localhost:8080/v1/chat/completions"
+GEMMA_MODEL = "mlx-community/gemma-4-e2b-it-4bit"
+GEMMA_STARTUP_TIMEOUT = 30
+GEMMA_CHAT_TIMEOUT = 60
 
 
 def _run_vision_ocr(cgimage):
@@ -259,6 +302,283 @@ def _run_whisper(wav_path):
         print(f"[whisper] transcribe 抛异常: {exc!r}", flush=True)
         traceback.print_exc()
         return ""
+
+
+def _is_url(text):
+    """判断剪贴板内容是不是单行的 http(s):// URL。"""
+    if not text:
+        return False
+    s = text.strip()
+    if not s or any(ch.isspace() for ch in s):
+        return False
+    return s.startswith("http://") or s.startswith("https://")
+
+
+def _clean_text(s):
+    if not s:
+        return None
+    out = " ".join(str(s).split()).strip()
+    return out or None
+
+
+def _host_matches(host, domains):
+    """精确域名 + 子域名命中。github.com 命中 github.com / www.github.com，但不命中 github.io。"""
+    if not host:
+        return False
+    h = host.lower()
+    return any(h == d or h.endswith("." + d) for d in domains)
+
+
+def _extract_site_specific(host, soup):
+    """第一层 —— 已知站点专用规则。无规则命中返回 (None, None)。"""
+    if not host:
+        return (None, None)
+    # arXiv：<meta name="citation_title"> + <blockquote class="abstract">
+    if _host_matches(host, ARXIV_DOMAINS):
+        cite = soup.find("meta", attrs={"name": "citation_title"})
+        title = _clean_text(cite.get("content")) if cite else None
+        if not title and soup.title and soup.title.string:
+            title = _clean_text(soup.title.string)
+        summary = None
+        bq = soup.find("blockquote", class_="abstract")
+        if bq:
+            txt = _clean_text(bq.get_text(" ", strip=True))
+            if txt:
+                low = txt.lower()
+                for prefix in ("abstract:", "abstract："):
+                    if low.startswith(prefix):
+                        txt = txt[len(prefix):].lstrip()
+                        break
+                summary = txt or None
+        return (title, summary)
+    # GitHub：<meta name="description">（YouTube 单独走 oEmbed，不进这里）
+    if _host_matches(host, GITHUB_DOMAINS):
+        title = _clean_text(soup.title.string) if (soup.title and soup.title.string) else None
+        meta = soup.find("meta", attrs={"name": "description"})
+        summary = _clean_text(meta.get("content")) if meta else None
+        return (title, summary)
+    # 学术 / 新闻：<meta property="og:title" | "og:description">
+    if _host_matches(host, OG_PREFERRED_DOMAINS):
+        og_t = soup.find("meta", attrs={"property": "og:title"})
+        title = _clean_text(og_t.get("content")) if og_t else None
+        if not title and soup.title and soup.title.string:
+            title = _clean_text(soup.title.string)
+        og_d = soup.find("meta", attrs={"property": "og:description"})
+        summary = _clean_text(og_d.get("content")) if og_d else None
+        return (title, summary)
+    return (None, None)
+
+
+def _extract_generic(soup):
+    """第二层 —— 通用规则：<title> + <meta name='description'>。"""
+    title = _clean_text(soup.title.string) if (soup.title and soup.title.string) else None
+    meta = soup.find("meta", attrs={"name": "description"})
+    summary = _clean_text(meta.get("content")) if meta else None
+    return (title, summary)
+
+
+def _extract_body_text(soup, max_len):
+    """正文前 max_len 字，给 Gemma 总结用。优先 <article>/<main> 容器里的 <p>。"""
+    container = soup.find("article") or soup.find("main") or soup.body or soup
+    paragraphs = [p.get_text(" ", strip=True) for p in container.find_all("p")]
+    text = " ".join(p for p in paragraphs if p)
+    if not text and container is not None:
+        text = container.get_text(" ", strip=True)
+    text = " ".join((text or "").split())
+    return text[:max_len].strip()
+
+
+def _is_gemma_alive(timeout=1):
+    if not _URL_FETCH_AVAILABLE:
+        return False
+    try:
+        r = requests.get(GEMMA_HEALTH_URL, timeout=timeout)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _start_gemma_async():
+    """后台启动 ~/start_secretary.sh，不阻塞当前线程。"""
+    try:
+        subprocess.Popen(
+            ["bash", "-lc", "nohup ~/start_secretary.sh >/tmp/secretary.log 2>&1 &"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[link/gemma] start_secretary.sh 启动失败: {exc!r}", flush=True)
+
+
+def _wait_for_gemma_ready(timeout=GEMMA_STARTUP_TIMEOUT):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _is_gemma_alive(timeout=1):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _stop_gemma():
+    """好邻居：pkill 自己启动的 mlx_lm.server。"""
+    try:
+        subprocess.run(
+            ["pkill", "-f", "mlx_lm.server"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[link/gemma] pkill 失败: {exc!r}", flush=True)
+
+
+def _summarize_with_gemma(body_text):
+    """用本地 Gemma 把正文总结为一句话；Gemma 离线则按需启动并在结束时关掉。"""
+    if not body_text or not _URL_FETCH_AVAILABLE:
+        return None
+    started_by_us = False
+    if not _is_gemma_alive():
+        print("[link/gemma] 未运行，按需启动 ~/start_secretary.sh", flush=True)
+        _start_gemma_async()
+        started_by_us = True
+        if not _wait_for_gemma_ready():
+            print("[link/gemma] 启动超时（30s）", flush=True)
+            _stop_gemma()
+            return None
+        print("[link/gemma] 已就绪", flush=True)
+    try:
+        payload = {
+            "model": GEMMA_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是网页摘要助手。用一句简短的中文（不超过80字）"
+                        "总结下面的网页内容。直接输出摘要本身，不加任何前缀。"
+                    ),
+                },
+                {"role": "user", "content": body_text},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 200,
+        }
+        r = requests.post(GEMMA_CHAT_URL, json=payload, timeout=GEMMA_CHAT_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        msg = data["choices"][0]["message"]
+        out = _clean_text(msg.get("content") or msg.get("reasoning") or "")
+        return out
+    except Exception as exc:  # noqa: BLE001
+        print(f"[link/gemma] 摘要失败: {exc!r}", flush=True)
+        return None
+    finally:
+        if started_by_us:
+            print("[link/gemma] 关闭按需启动的实例", flush=True)
+            _stop_gemma()
+
+
+def _fetch_youtube_oembed(url):
+    """YouTube 走官方 oEmbed 端点，不解析 HTML —— 简单可靠还躲过反爬。"""
+    if not _URL_FETCH_AVAILABLE:
+        return (None, None)
+    try:
+        r = requests.get(
+            "https://www.youtube.com/oembed",
+            params={"url": url, "format": "json"},
+            headers={"User-Agent": URL_FETCH_UA},
+            timeout=URL_FETCH_TIMEOUT,
+        )
+        r.raise_for_status()
+        data = r.json()
+        title = _clean_text(data.get("title"))
+        if not title:
+            return (None, None)
+        return (title, f"YouTube 视频：{title}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[link/youtube] oEmbed 失败: {exc!r}", flush=True)
+        return (None, None)
+
+
+def _http_get_soup(url, ua):
+    """统一的 HTTP→BeautifulSoup；失败抛异常。"""
+    resp = requests.get(
+        url,
+        timeout=URL_FETCH_TIMEOUT,
+        headers={"User-Agent": ua},
+        allow_redirects=True,
+    )
+    resp.raise_for_status()
+    # 默认 ISO-8859-1 会把中文页面打成乱码
+    if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
+        resp.encoding = resp.apparent_encoding or "utf-8"
+    return BeautifulSoup(resp.text, "html.parser")
+
+
+def _fetch_url_summary(url):
+    """三层抓取：站点专用 → 通用 <title>+description → Gemma 兜底。"""
+    if not _URL_FETCH_AVAILABLE:
+        print("[link] requests / bs4 未安装，跳过抓取", flush=True)
+        return (None, None)
+
+    host = (urlparse(url).hostname or "").lower()
+
+    # YouTube 短路：用 oEmbed API，命中就直接返回，不啃 HTML
+    if _host_matches(host, YOUTUBE_DOMAINS):
+        yt_title, yt_summary = _fetch_youtube_oembed(url)
+        if yt_title:
+            print(f"[link] YouTube oEmbed hit; title={yt_title!r}", flush=True)
+            return (yt_title, yt_summary)
+        # oEmbed 失败则降级到通用 HTML 流程
+
+    # 抓 HTML：先用 Chrome UA；失败时换 Firefox UA 重试一次
+    soup = None
+    last_exc = None
+    for attempt, ua in enumerate((URL_FETCH_UA, URL_FETCH_UA_ALT), start=1):
+        try:
+            soup = _http_get_soup(url, ua)
+            if attempt > 1:
+                print(f"[link] fetch {url!r} 备用 UA 成功", flush=True)
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            print(
+                f"[link] fetch {url!r} UA#{attempt} 失败: {exc!r}"
+                + ("；换备用 UA 重试" if attempt == 1 else ""),
+                flush=True,
+            )
+    if soup is None:
+        print(f"[link] fetch {url!r} 两次都失败: {last_exc!r}", flush=True)
+        return (None, None)
+
+    # 第一层 —— 站点专用规则
+    title, summary = _extract_site_specific(host, soup)
+    if title and summary:
+        print(f"[link] L1 site rule hit host={host!r}; title={title!r}; summary_len={len(summary)}", flush=True)
+        return (title, summary)
+
+    # 第二层 —— 通用 <title> + <meta description>
+    gen_title, gen_summary = _extract_generic(soup)
+    title = title or gen_title
+    summary = summary or gen_summary
+    if title and summary:
+        print(f"[link] L2 generic; title={title!r}; summary_len={len(summary)}", flush=True)
+        return (title, summary)
+
+    # 第三层 —— Gemma 兜底（仅在缺摘要时）
+    if not summary:
+        body = _extract_body_text(soup, URL_BODY_FOR_LLM)
+        if body:
+            print(f"[link] L3 Gemma fallback; body_len={len(body)}", flush=True)
+            ai = _summarize_with_gemma(body)
+            if ai:
+                summary = ai
+
+    print(f"[link] final; title={title!r}; summary_len={len(summary or '')}", flush=True)
+    return (title, summary)
 
 
 class FloaterWindow(NSWindow):
@@ -477,6 +797,7 @@ class FloaterController(NSObject):
         self._pb_old_count = 0
         self._recording = False
         self._transcribing = False
+        self._url_fetching = False
         self._recorder = AudioRecorder()
         self._mic_button = None
         self._mic_icon_idle = None
@@ -666,9 +987,23 @@ class FloaterController(NSObject):
             f"prefill={snippet!r}",
             flush=True,
         )
-        self.text_view.setString_(prefill)
-        if prefill:
-            self.text_view.setSelectedRange_(NSMakeRange(len(prefill), 0))
+        # 是 URL → 先放占位符 + URL，后台线程抓取；否则原样填入
+        if _is_url(prefill):
+            url = prefill.strip()
+            placeholder = f"{URL_FETCH_PLACEHOLDER}\n{url}"
+            self.text_view.setString_(placeholder)
+            self.text_view.setSelectedRange_(NSMakeRange(len(placeholder), 0))
+            # 抓取（尤其是 Gemma 兜底）可能要 30s+，期间用户切走不能算取消
+            self._url_fetching = True
+            threading.Thread(
+                target=self._url_fetch_worker,
+                args=(url, placeholder),
+                daemon=True,
+            ).start()
+        else:
+            self.text_view.setString_(prefill)
+            if prefill:
+                self.text_view.setSelectedRange_(NSMakeRange(len(prefill), 0))
         self.text_view.setNeedsDisplay_(True)
         self._resize_to_content()
         self._position_near_cursor()
@@ -678,6 +1013,47 @@ class FloaterController(NSObject):
         self.window.makeFirstResponder_(self.text_view)
         self._visible = True
         self._fade_to_(1.0, None)
+
+    def _url_fetch_worker(self, url, placeholder):
+        tid = threading.get_ident()
+        print(f"[link tid={tid}] fetching {url!r}", flush=True)
+        title, summary = _fetch_url_summary(url)
+        if title or summary:
+            parts = []
+            if title:
+                parts.append(f"[链接] {title}")
+            else:
+                parts.append("[链接]")
+            parts.append(url)
+            if summary:
+                parts.append(summary)
+            result = "\n".join(parts)
+        else:
+            # 抓取失败 → 只留裸 URL
+            result = url
+        print(f"[link tid={tid}] result len={len(result)}; scheduling main-thread fill", flush=True)
+        AppHelper.callAfter(self._onUrlFetchDone_, (placeholder, result))
+
+    def _onUrlFetchDone_(self, payload):
+        self._url_fetching = False
+        placeholder, result = payload
+        current = str(self.text_view.string())
+        if current != placeholder:
+            # 用户已经动过 textview（或悬浮框已 hide），放弃覆盖
+            print("[link] textview 已被用户改写，丢弃抓取结果", flush=True)
+            return
+        if not self._visible:
+            print("[link] _visible=False，丢弃抓取结果", flush=True)
+            return
+        self.text_view.setString_(result)
+        self.text_view.setSelectedRange_(NSMakeRange(len(result), 0))
+        self.text_view.setNeedsDisplay_(True)
+        self._resize_to_content()
+        # 抓取期间用户可能切走，把悬浮框拉回前台
+        NSApp.activateIgnoringOtherApps_(True)
+        self.window.makeKeyAndOrderFront_(None)
+        self.window.makeFirstResponder_(self.text_view)
+        print(f"[link] textview 已更新到 len={len(result)}", flush=True)
 
     def _send_cmd_c(self):
         KEY_C = 8  # macOS virtual keycode for 'c'
@@ -927,6 +1303,10 @@ class FloaterController(NSObject):
         if self._transcribing:
             # 转写可能要几十秒（首次还要拉模型），期间用户切到别处不能算取消
             print("[focus] 转写中，忽略本次失焦", flush=True)
+            return
+        if self._url_fetching:
+            # URL 抓取（尤其 Gemma 兜底）也是长流程，同样不算取消
+            print("[focus] 链接抓取中，忽略本次失焦", flush=True)
             return
         if self._visible:
             self.hide()
