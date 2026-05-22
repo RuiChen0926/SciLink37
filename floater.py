@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Floater: 原生 macOS 悬浮捕获（PyObjC + NSVisualEffectView）。
-双击 Command 触发（任何场景：浏览器、输入框、全屏 app 都可），Enter 保存到 inbox.md，Esc / 失焦取消。
+双击 Command 触发（任何场景：浏览器、输入框、全屏 app 都可）。
+Enter 保存到 inbox.md，Esc / 失焦取消。
+悬浮框右下角有「框选文字」按钮：点击后整屏覆盖半透明遮罩，
+拖拽选区，松手后用 macOS Vision (VNRecognizeTextRequest) 做 OCR，
+识别结果自动回填到输入框，用户确认后再 Enter 入库。
 全局热键基于 CGEventTap (kCGSessionEventTap + kCGHeadInsertEventTap)，
 监听 flagsChanged 检测 Command 的「干净双击」——两次按下间隔 < 0.4s，且中间没有其他键。"""
 import time
@@ -14,17 +18,28 @@ from AppKit import (
     NSApplication,
     NSApplicationActivationPolicyAccessory,
     NSBackingStoreBuffered,
+    NSBezierPath,
+    NSButton,
     NSColor,
+    NSCursor,
     NSEvent,
     NSEventModifierFlagShift,
     NSFloatingWindowLevel,
     NSFont,
     NSFontAttributeName,
     NSForegroundColorAttributeName,
+    NSImage,
+    NSPasteboard,
+    NSPasteboardTypeString,
+    NSRectFillUsingOperation,
     NSScreen,
+    NSScreenSaverWindowLevel,
     NSScrollView,
     NSTextView,
+    NSView,
     NSViewHeightSizable,
+    NSViewMaxYMargin,
+    NSViewMinXMargin,
     NSViewWidthSizable,
     NSVisualEffectBlendingModeBehindWindow,
     NSVisualEffectMaterialPopover,
@@ -37,6 +52,7 @@ from AppKit import (
 from Foundation import (
     NSAttributedString,
     NSMakePoint,
+    NSMakeRange,
     NSMakeRect,
     NSMakeSize,
     NSNotificationCenter,
@@ -50,17 +66,29 @@ from CoreFoundation import (
 )
 from PyObjCTools import AppHelper
 from Quartz import (
+    CGEventCreateKeyboardEvent,
     CGEventGetFlags,
     CGEventMaskBit,
+    CGEventPost,
+    CGEventSetFlags,
     CGEventTapCreate,
     CGEventTapEnable,
+    CGRectMake,
+    CGWindowListCreateImage,
     kCGEventFlagMaskCommand,
     kCGEventFlagsChanged,
     kCGEventKeyDown,
     kCGEventTapDisabledByTimeout,
     kCGEventTapOptionListenOnly,
+    kCGHIDEventTap,
     kCGHeadInsertEventTap,
     kCGSessionEventTap,
+    kCGWindowImageDefault,
+    kCGWindowListOptionOnScreenBelowWindow,
+)
+from Vision import (
+    VNImageRequestHandler,
+    VNRecognizeTextRequest,
 )
 
 
@@ -74,6 +102,42 @@ FONT_SIZE = 15.0
 PLACEHOLDER = "记录想法..."
 FADE_DURATION = 0.12
 DOUBLE_TAP_INTERVAL = 0.4  # seconds, press-to-press
+OCR_BTN_SIZE = 20.0
+OCR_BTN_MARGIN = 6.0
+TEXT_RIGHT_GAP = OCR_BTN_SIZE + 4.0  # 留出右下角按钮的位置，避免文本盖到上面
+# NSCompositingOperation 常量值（避免依赖某些 PyObjC 版本不导出的别名）
+NS_COMPOSITE_CLEAR = 0
+NS_COMPOSITE_SOURCE_OVER = 2
+NS_IMAGE_ONLY = 1  # NSCellImagePosition.imageOnly
+
+
+def _run_vision_ocr(cgimage):
+    """同步跑 Vision 文本识别。失败/无结果返回空串。"""
+    if cgimage is None:
+        return ""
+    try:
+        handler = VNImageRequestHandler.alloc().initWithCGImage_options_(cgimage, {})
+        request = VNRecognizeTextRequest.alloc().init()
+        # VNRequestTextRecognitionLevelAccurate = 0
+        request.setRecognitionLevel_(0)
+        request.setUsesLanguageCorrection_(True)
+        try:
+            request.setRecognitionLanguages_(["zh-Hans", "en-US"])
+        except Exception:
+            pass
+        ok, _err = handler.performRequests_error_([request], None)
+        if not ok:
+            return ""
+        results = request.results() or []
+        lines = []
+        for obs in results:
+            candidates = obs.topCandidates_(1)
+            if candidates and len(candidates) > 0:
+                lines.append(str(candidates[0].string()))
+        return "\n".join(lines)
+    except Exception as exc:
+        print(f"OCR 失败: {exc}")
+        return ""
 
 
 class FloaterWindow(NSWindow):
@@ -120,6 +184,166 @@ class FloaterTextView(NSTextView):
         ph.drawAtPoint_(NSMakePoint(origin.x + padding, origin.y))
 
 
+class OCROverlayView(NSView):
+    """覆盖整屏的半透明遮罩；拖拽产生选区，松手交给 window delegate。"""
+
+    def initWithFrame_(self, frame):
+        self = objc.super(OCROverlayView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._start = None
+        self._current = None
+        return self
+
+    def acceptsFirstResponder(self):
+        return True
+
+    def acceptsFirstMouse_(self, event):
+        return True
+
+    def mouseDown_(self, event):
+        self._start = event.locationInWindow()
+        self._current = self._start
+        self.setNeedsDisplay_(True)
+
+    def mouseDragged_(self, event):
+        self._current = event.locationInWindow()
+        self.setNeedsDisplay_(True)
+
+    def mouseUp_(self, event):
+        self._current = event.locationInWindow()
+        self.setNeedsDisplay_(True)
+        delegate = self.window().delegate()
+        if delegate is None:
+            return
+        if self._start is None:
+            delegate.selectionCancelled()
+            return
+        x = min(self._start.x, self._current.x)
+        y = min(self._start.y, self._current.y)
+        w = abs(self._start.x - self._current.x)
+        h = abs(self._start.y - self._current.y)
+        if w < 4 or h < 4:
+            delegate.selectionCancelled()
+            return
+        delegate.selectionFinishedWithRect_(NSMakeRect(x, y, w, h))
+
+    def keyDown_(self, event):
+        chars = event.charactersIgnoringModifiers() or ""
+        if chars == "\x1b":
+            delegate = self.window().delegate()
+            if delegate is not None:
+                delegate.selectionCancelled()
+            return
+        objc.super(OCROverlayView, self).keyDown_(event)
+
+    def drawRect_(self, dirty):
+        # 整屏暗一点
+        NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.32).set()
+        NSRectFillUsingOperation(self.bounds(), NS_COMPOSITE_SOURCE_OVER)
+        if self._start is None or self._current is None:
+            return
+        x = min(self._start.x, self._current.x)
+        y = min(self._start.y, self._current.y)
+        w = abs(self._start.x - self._current.x)
+        h = abs(self._start.y - self._current.y)
+        if w < 1 or h < 1:
+            return
+        sel_rect = NSMakeRect(x, y, w, h)
+        # 用 Clear 操作在遮罩上挖出全透明的选区
+        NSColor.clearColor().set()
+        NSRectFillUsingOperation(sel_rect, NS_COMPOSITE_CLEAR)
+        # 白色细边框
+        NSColor.whiteColor().set()
+        path = NSBezierPath.bezierPathWithRect_(sel_rect)
+        path.setLineWidth_(1.5)
+        path.stroke()
+
+
+class OCROverlayWindow(NSWindow):
+    def canBecomeKeyWindow(self):
+        return True
+
+
+class OCROverlayController(NSObject):
+    """整屏选区取词的控制器：建窗 → 拖拽 → 截图 → 调用 completion(image_or_None)。"""
+
+    def initWithCompletion_(self, completion):
+        self = objc.super(OCROverlayController, self).init()
+        if self is None:
+            return None
+        self._completion = completion
+        self._fired = False
+        screen = NSScreen.mainScreen() or NSScreen.screens()[0]
+        self._screen_frame = screen.frame()
+        win = OCROverlayWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            self._screen_frame,
+            NSWindowStyleMaskBorderless,
+            NSBackingStoreBuffered,
+            False,
+        )
+        win.setLevel_(NSScreenSaverWindowLevel)
+        win.setOpaque_(False)
+        win.setBackgroundColor_(NSColor.clearColor())
+        win.setHasShadow_(False)
+        win.setIgnoresMouseEvents_(False)
+        win.setAcceptsMouseMovedEvents_(True)
+        win.setReleasedWhenClosed_(False)
+        win.setDelegate_(self)
+        view = OCROverlayView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, self._screen_frame.size.width, self._screen_frame.size.height)
+        )
+        win.setContentView_(view)
+        self.window = win
+        self._view = view
+        return self
+
+    def show(self):
+        self.window.makeKeyAndOrderFront_(None)
+        NSApp.activateIgnoringOtherApps_(True)
+        self.window.makeFirstResponder_(self._view)
+        NSCursor.crosshairCursor().push()
+
+    def _fire_completion(self, image):
+        if self._fired:
+            return
+        self._fired = True
+        NSCursor.pop()
+        self.window.orderOut_(None)
+        if self._completion is not None:
+            cb = self._completion
+            self._completion = None
+            cb(image)
+
+    def selectionFinishedWithRect_(self, rect_in_view):
+        # rect 在 view 坐标，等于 window 坐标（view 满铺窗口），窗口又满铺整屏
+        win_origin = self.window.frame().origin
+        cocoa_x = win_origin.x + rect_in_view.origin.x
+        cocoa_y = win_origin.y + rect_in_view.origin.y
+        w = rect_in_view.size.width
+        h = rect_in_view.size.height
+        # Cocoa 全局坐标 → CG 全局坐标：以主屏 (screens()[0]) 顶部为 y=0，向下增
+        primary_h = NSScreen.screens()[0].frame().size.height
+        cg_y = primary_h - cocoa_y - h
+        cg_rect = CGRectMake(cocoa_x, cg_y, w, h)
+        win_id = self.window.windowNumber()
+        # 用「在我下面的窗口」选项，把自己的遮罩从截图里排除（不依赖 orderOut 时序）
+        img = CGWindowListCreateImage(
+            cg_rect,
+            kCGWindowListOptionOnScreenBelowWindow,
+            win_id,
+            kCGWindowImageDefault,
+        )
+        self._fire_completion(img)
+
+    def selectionCancelled(self):
+        self._fire_completion(None)
+
+    def windowDidResignKey_(self, _notif):
+        # 失焦视作取消（用户切到别处了）
+        self._fire_completion(None)
+
+
 class FloaterController(NSObject):
     def init(self):
         self = objc.super(FloaterController, self).init()
@@ -127,6 +351,9 @@ class FloaterController(NSObject):
             return None
         self._visible = False
         self._prev_app = None
+        self._in_ocr = False
+        self._ocr_overlay = None
+        self._pb_old_count = 0
         self._build()
         return self
 
@@ -159,8 +386,14 @@ class FloaterController(NSObject):
         effect.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
         self.window.setContentView_(effect)
 
-        # 文本输入区（NSTextView 嵌在 NSScrollView 里，支持多行 + 超长时滚动）
-        inner = NSMakeRect(PAD, PAD, WIDTH - 2 * PAD, MIN_HEIGHT - 2 * PAD)
+        # 文本输入区（NSTextView 嵌在 NSScrollView 里，多行 + 超长时滚动）
+        # 右边留 TEXT_RIGHT_GAP 给 OCR 按钮
+        inner = NSMakeRect(
+            PAD,
+            PAD,
+            WIDTH - 2 * PAD - TEXT_RIGHT_GAP,
+            MIN_HEIGHT - 2 * PAD,
+        )
         scroll = NSScrollView.alloc().initWithFrame_(inner)
         scroll.setBorderType_(0)  # NSNoBorder
         scroll.setDrawsBackground_(False)
@@ -188,6 +421,39 @@ class FloaterController(NSObject):
         scroll.setDocumentView_(self.text_view)
         effect.addSubview_(scroll)
 
+        # 右下角「框选文字」按钮（SF Symbol "text.viewfinder"；不可用时退回文字）
+        btn_frame = NSMakeRect(
+            WIDTH - OCR_BTN_SIZE - OCR_BTN_MARGIN,
+            OCR_BTN_MARGIN,
+            OCR_BTN_SIZE,
+            OCR_BTN_SIZE,
+        )
+        btn = NSButton.alloc().initWithFrame_(btn_frame)
+        btn.setBordered_(False)
+        btn.setBezelStyle_(0)
+        btn.setTitle_("")
+        icon = None
+        try:
+            icon = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                "text.viewfinder",
+                "框选文字识别",
+            )
+        except Exception:
+            icon = None
+        if icon is not None:
+            icon.setSize_(NSMakeSize(16, 16))
+            btn.setImage_(icon)
+            btn.setImagePosition_(NS_IMAGE_ONLY)
+        else:
+            btn.setTitle_("OCR")
+        btn.setToolTip_("框选文字识别")
+        btn.setTarget_(self)
+        btn.setAction_("ocrButtonClicked:")
+        # 锚到右下角：左边距与上边距灵活
+        btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
+        effect.addSubview_(btn)
+        self._ocr_button = btn
+
         NSNotificationCenter.defaultCenter().addObserver_selector_name_object_(
             self,
             "textDidChange:",
@@ -201,15 +467,78 @@ class FloaterController(NSObject):
         if self._visible:
             return
         self._prev_app = NSWorkspace.sharedWorkspace().frontmostApplication()
-        self.text_view.setString_("")
+        prev_name = self._prev_app.localizedName() if self._prev_app is not None else "<none>"
+        prev_pid = self._prev_app.processIdentifier() if self._prev_app is not None else -1
+        # 触发前若有选中文字，发一次合成 Cmd+C 把选区抓到剪贴板；
+        # 等 150ms 让源 app 把数据贴上 pasteboard，再读取并继续显示。
+        pb = NSPasteboard.generalPasteboard()
+        self._pb_old_count = pb.changeCount()
+        print(
+            f"[floater] trigger: prev_app={prev_name!r} (pid={prev_pid}), "
+            f"pb.changeCount(pre)={self._pb_old_count}",
+            flush=True,
+        )
+        self._send_cmd_c()
+        # 注意：_continue_show 里【先读剪贴板再激活悬浮框】。如果反过来，本进程会变成
+        # key window，源 app 失焦——但更糟的是 100ms 内合成事件还在飞，等 Cmd+C 落地时
+        # 目标已经是我们自己空的 textview，pasteboard 永远不会更新。
+        AppHelper.callLater(0.15, self._continue_show)
+
+    def _continue_show(self):
+        pb = NSPasteboard.generalPasteboard()
+        cur_count = pb.changeCount()
+        types = list(pb.types() or [])
+        raw = pb.stringForType_(NSPasteboardTypeString)
+        prefill = self._read_clipboard_text(self._pb_old_count)
+        snippet = prefill if len(prefill) <= 80 else (prefill[:80] + "...")
+        print(
+            f"[floater] post-wait: pb.changeCount={cur_count} "
+            f"(was {self._pb_old_count}, changed={cur_count != self._pb_old_count}); "
+            f"pb.types={types}; "
+            f"has_string_type={raw is not None}; "
+            f"prefill={snippet!r}",
+            flush=True,
+        )
+        self.text_view.setString_(prefill)
+        if prefill:
+            self.text_view.setSelectedRange_(NSMakeRange(len(prefill), 0))
         self.text_view.setNeedsDisplay_(True)
         self._resize_to_content()
         self._position_near_cursor()
+        # 读完剪贴板才激活：上面已经读过了，到这里激活才安全
         NSApp.activateIgnoringOtherApps_(True)
         self.window.makeKeyAndOrderFront_(None)
         self.window.makeFirstResponder_(self.text_view)
         self._visible = True
         self._fade_to_(1.0, None)
+
+    def _send_cmd_c(self):
+        KEY_C = 8  # macOS virtual keycode for 'c'
+        ev_down = CGEventCreateKeyboardEvent(None, KEY_C, True)
+        ev_up = CGEventCreateKeyboardEvent(None, KEY_C, False)
+        if ev_down is None or ev_up is None:
+            print(
+                f"[floater] WARN: CGEventCreateKeyboardEvent 失败 "
+                f"(down={ev_down}, up={ev_up})",
+                flush=True,
+            )
+            return
+        CGEventSetFlags(ev_down, kCGEventFlagMaskCommand)
+        CGEventSetFlags(ev_up, kCGEventFlagMaskCommand)
+        CGEventPost(kCGHIDEventTap, ev_down)
+        CGEventPost(kCGHIDEventTap, ev_up)
+        print("[floater] sent synthetic Cmd+C via kCGHIDEventTap", flush=True)
+
+    def _read_clipboard_text(self, old_count):
+        pb = NSPasteboard.generalPasteboard()
+        # 只在 Cmd+C 真正写入了新内容时才采用，避免拉到陈旧的剪贴板文本
+        if pb.changeCount() == old_count:
+            return ""
+        # 只取纯文字；图片或其它非文本类型一律忽略
+        s = pb.stringForType_(NSPasteboardTypeString)
+        if not s:
+            return ""
+        return str(s)
 
     def hide(self):
         if not self._visible:
@@ -239,9 +568,56 @@ class FloaterController(NSObject):
     def cancel(self):
         self.hide()
 
+    # ---- OCR 流程 ----
+
+    def ocrButtonClicked_(self, _sender):
+        if self._in_ocr:
+            return
+        self._in_ocr = True
+        # 把现有输入文本缓存下来，OCR 结束后追加到这后面
+        self._pre_ocr_text = str(self.text_view.string())
+        # 暂时下线悬浮框（直接 orderOut，不走 hide，不要把 prev_app 还回去也不要 fade）
+        self.window.orderOut_(None)
+        self._visible = False
+        self._ocr_overlay = OCROverlayController.alloc().initWithCompletion_(
+            self._onOcrImage_
+        )
+        self._ocr_overlay.show()
+
+    def _onOcrImage_(self, cgimage):
+        self._ocr_overlay = None
+        self._in_ocr = False
+        prev = getattr(self, "_pre_ocr_text", "") or ""
+        if cgimage is None:
+            # 取消 → 还原原文本
+            self._reshow_floater(prev)
+            return
+        recognized = _run_vision_ocr(cgimage)
+        if prev and recognized:
+            new_text = prev + "\n" + recognized
+        else:
+            new_text = prev + recognized
+        self._reshow_floater(new_text)
+
+    def _reshow_floater(self, prefill):
+        self.text_view.setString_(prefill or "")
+        if prefill:
+            self.text_view.setSelectedRange_(NSMakeRange(len(prefill), 0))
+        self.text_view.setNeedsDisplay_(True)
+        self._resize_to_content()
+        self._position_near_cursor()
+        self.window.setAlphaValue_(1.0)
+        NSApp.activateIgnoringOtherApps_(True)
+        self.window.makeKeyAndOrderFront_(None)
+        self.window.makeFirstResponder_(self.text_view)
+        self._visible = True
+
     # ---- delegate / observer ----
 
     def windowDidResignKey_(self, _notif):
+        if self._in_ocr:
+            # OCR 过程中悬浮框被 orderOut 掉了，这次 resignKey 不算用户失焦取消
+            return
         if self._visible:
             self.hide()
 
