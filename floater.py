@@ -7,7 +7,11 @@ Enter 保存到 inbox.md，Esc / 失焦取消。
 识别结果自动回填到输入框，用户确认后再 Enter 入库。
 全局热键基于 CGEventTap (kCGSessionEventTap + kCGHeadInsertEventTap)，
 监听 flagsChanged 检测 Command 的「干净双击」——两次按下间隔 < 0.4s，且中间没有其他键。"""
+import os
+import tempfile
+import threading
 import time
+import wave
 from datetime import datetime
 from pathlib import Path
 
@@ -91,6 +95,25 @@ from Vision import (
     VNRecognizeTextRequest,
 )
 
+# 语音输入相关依赖：缺失时降级（按钮仍显示，但点击会打日志）
+try:
+    import numpy as np
+    import sounddevice as sd
+    _AUDIO_AVAILABLE = True
+except Exception as _exc:  # noqa: BLE001
+    np = None  # type: ignore[assignment]
+    sd = None  # type: ignore[assignment]
+    _AUDIO_AVAILABLE = False
+    print(f"[floater] 录音依赖缺失: {_exc}（pip install sounddevice numpy）", flush=True)
+
+try:
+    import mlx_whisper
+    _WHISPER_AVAILABLE = True
+except Exception as _exc:  # noqa: BLE001
+    mlx_whisper = None  # type: ignore[assignment]
+    _WHISPER_AVAILABLE = False
+    print(f"[floater] mlx_whisper 未安装: {_exc}（pip install mlx-whisper）", flush=True)
+
 
 INBOX = Path("/Users/rui/Projects/SciLink37/inbox.md")
 WIDTH = 400.0
@@ -104,11 +127,15 @@ FADE_DURATION = 0.12
 DOUBLE_TAP_INTERVAL = 0.4  # seconds, press-to-press
 OCR_BTN_SIZE = 20.0
 OCR_BTN_MARGIN = 6.0
-TEXT_RIGHT_GAP = OCR_BTN_SIZE + 4.0  # 留出右下角按钮的位置，避免文本盖到上面
+MIC_BTN_SIZE = 20.0
+BTN_GAP = 4.0
+TEXT_RIGHT_GAP = OCR_BTN_SIZE + BTN_GAP + MIC_BTN_SIZE + 4.0  # OCR + 麦克风两个按钮的预留宽度
 # NSCompositingOperation 常量值（避免依赖某些 PyObjC 版本不导出的别名）
 NS_COMPOSITE_CLEAR = 0
 NS_COMPOSITE_SOURCE_OVER = 2
 NS_IMAGE_ONLY = 1  # NSCellImagePosition.imageOnly
+WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
+WHISPER_SAMPLE_RATE = 16000
 
 
 def _run_vision_ocr(cgimage):
@@ -137,6 +164,100 @@ def _run_vision_ocr(cgimage):
         return "\n".join(lines)
     except Exception as exc:
         print(f"OCR 失败: {exc}")
+        return ""
+
+
+class AudioRecorder:
+    """sounddevice 输入流采样到内存，stop_to_wav 时把累计样本写成 16-bit PCM WAV。"""
+
+    def __init__(self, sample_rate=WHISPER_SAMPLE_RATE):
+        self._sr = sample_rate
+        self._stream = None
+        self._chunks = []
+
+    def start(self):
+        if not _AUDIO_AVAILABLE:
+            raise RuntimeError("sounddevice / numpy 未安装")
+        self._chunks = []
+
+        def _cb(indata, frames, time_info, status):
+            if status:
+                # 不打断录音，只打个日志
+                print(f"[floater] mic status: {status}", flush=True)
+            self._chunks.append(indata.copy())
+
+        self._stream = sd.InputStream(
+            samplerate=self._sr,
+            channels=1,
+            dtype="float32",
+            callback=_cb,
+        )
+        self._stream.start()
+
+    def stop_to_wav(self):
+        if self._stream is None:
+            return None
+        try:
+            self._stream.stop()
+            self._stream.close()
+        finally:
+            self._stream = None
+        if not self._chunks:
+            return None
+        audio = np.concatenate(self._chunks, axis=0).flatten()
+        if audio.size == 0:
+            return None
+        pcm = np.clip(audio * 32767.0, -32768, 32767).astype(np.int16)
+        fd, path = tempfile.mkstemp(suffix=".wav", prefix="scilink_voice_")
+        os.close(fd)
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self._sr)
+            wf.writeframes(pcm.tobytes())
+        return path
+
+    def abort(self):
+        if self._stream is None:
+            return
+        try:
+            self._stream.abort()
+            self._stream.close()
+        finally:
+            self._stream = None
+        self._chunks = []
+
+
+def _run_whisper(wav_path):
+    """同步跑 mlx-whisper。返回识别文本（已 strip）。首次调用会下载模型，可能要等几十秒。"""
+    print(
+        f"[whisper] _run_whisper enter; wav={wav_path}; available={_WHISPER_AVAILABLE}",
+        flush=True,
+    )
+    if not _WHISPER_AVAILABLE:
+        print("[whisper] mlx_whisper 不可用，跳过转写", flush=True)
+        return ""
+    t0 = time.monotonic()
+    try:
+        result = mlx_whisper.transcribe(
+            wav_path,
+            path_or_hf_repo=WHISPER_MODEL,
+        )
+        dt = time.monotonic() - t0
+        result_keys = list(result.keys()) if hasattr(result, "keys") else None
+        raw = result.get("text") if hasattr(result, "get") else None
+        text = (raw or "").strip()
+        print(
+            f"[whisper] transcribe done in {dt:.2f}s; "
+            f"result_type={type(result).__name__}; keys={result_keys}; "
+            f"raw_text={raw!r}; stripped_text={text!r} (len={len(text)})",
+            flush=True,
+        )
+        return text
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        print(f"[whisper] transcribe 抛异常: {exc!r}", flush=True)
+        traceback.print_exc()
         return ""
 
 
@@ -354,6 +475,12 @@ class FloaterController(NSObject):
         self._in_ocr = False
         self._ocr_overlay = None
         self._pb_old_count = 0
+        self._recording = False
+        self._transcribing = False
+        self._recorder = AudioRecorder()
+        self._mic_button = None
+        self._mic_icon_idle = None
+        self._mic_icon_recording = None
         self._build()
         return self
 
@@ -454,6 +581,46 @@ class FloaterController(NSObject):
         effect.addSubview_(btn)
         self._ocr_button = btn
 
+        # 麦克风按钮：放在 OCR 按钮左边
+        mic_frame = NSMakeRect(
+            WIDTH - OCR_BTN_SIZE - OCR_BTN_MARGIN - BTN_GAP - MIC_BTN_SIZE,
+            OCR_BTN_MARGIN,
+            MIC_BTN_SIZE,
+            MIC_BTN_SIZE,
+        )
+        mic_btn = NSButton.alloc().initWithFrame_(mic_frame)
+        mic_btn.setBordered_(False)
+        mic_btn.setBezelStyle_(0)
+        mic_btn.setTitle_("")
+        mic_idle = None
+        mic_rec = None
+        try:
+            mic_idle = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                "mic", "语音输入",
+            )
+            mic_rec = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                "mic.fill", "录音中",
+            )
+        except Exception:
+            mic_idle = None
+            mic_rec = None
+        if mic_idle is not None:
+            mic_idle.setSize_(NSMakeSize(16, 16))
+            mic_btn.setImage_(mic_idle)
+            mic_btn.setImagePosition_(NS_IMAGE_ONLY)
+        else:
+            mic_btn.setTitle_("MIC")
+        if mic_rec is not None:
+            mic_rec.setSize_(NSMakeSize(16, 16))
+        mic_btn.setToolTip_("语音输入（mlx-whisper）")
+        mic_btn.setTarget_(self)
+        mic_btn.setAction_("micButtonClicked:")
+        mic_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
+        effect.addSubview_(mic_btn)
+        self._mic_button = mic_btn
+        self._mic_icon_idle = mic_idle
+        self._mic_icon_recording = mic_rec
+
         NSNotificationCenter.defaultCenter().addObserver_selector_name_object_(
             self,
             "textDidChange:",
@@ -543,6 +710,20 @@ class FloaterController(NSObject):
     def hide(self):
         if not self._visible:
             return
+        import traceback
+        print(
+            f"[hide] called; _recording={self._recording}; _in_ocr={self._in_ocr}",
+            flush=True,
+        )
+        traceback.print_stack(limit=6)
+        # 录音中被取消：丢弃缓冲，不走转写
+        if self._recording:
+            try:
+                self._recorder.abort()
+            except Exception:
+                pass
+            self._recording = False
+            self._setMicRecordingVisual_(False)
         # 先把 _visible 置否，防止 windowDidResignKey 在动画中再次进入 hide
         self._visible = False
         prev = self._prev_app
@@ -612,11 +793,140 @@ class FloaterController(NSObject):
         self.window.makeFirstResponder_(self.text_view)
         self._visible = True
 
+    # ---- 语音输入流程 ----
+
+    def micButtonClicked_(self, _sender):
+        if self._recording:
+            self._stop_recording_and_transcribe()
+        else:
+            self._start_recording()
+
+    def _start_recording(self):
+        if not _AUDIO_AVAILABLE:
+            print("[floater] sounddevice 未安装，无法录音", flush=True)
+            return
+        try:
+            self._recorder.start()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[floater] 录音启动失败（首次可能需要麦克风权限）: {exc}", flush=True)
+            return
+        self._recording = True
+        self._setMicRecordingVisual_(True)
+        print("[floater] 开始录音", flush=True)
+
+    def _stop_recording_and_transcribe(self):
+        if not self._recording:
+            return
+        self._recording = False
+        self._setMicRecordingVisual_(False)
+        try:
+            wav_path = self._recorder.stop_to_wav()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[floater] 录音停止失败: {exc}", flush=True)
+            return
+        if not wav_path:
+            print("[floater] 没有采到音频", flush=True)
+            return
+        print(f"[floater] 录音保存 {wav_path}，开始转写...", flush=True)
+        # 关键：转写期间禁止「失焦即 hide」，否则模型下载/推理一长，用户切到别处就会丢结果
+        self._transcribing = True
+        if self._mic_button is not None:
+            self._mic_button.setEnabled_(False)
+
+        def worker():
+            tid = threading.get_ident()
+            text = ""
+            try:
+                print(f"[worker tid={tid}] starting _run_whisper", flush=True)
+                text = _run_whisper(wav_path)
+                print(f"[worker tid={tid}] _run_whisper returned text len={len(text)}", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                import traceback
+                print(f"[worker tid={tid}] uncaught: {exc!r}", flush=True)
+                traceback.print_exc()
+            finally:
+                try:
+                    os.unlink(wav_path)
+                    print(f"[worker tid={tid}] unlinked {wav_path}", flush=True)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[worker tid={tid}] unlink 失败: {exc!r}", flush=True)
+            print(
+                f"[worker tid={tid}] scheduling AppHelper.callAfter(_onTranscriptionDone_, text len={len(text)})",
+                flush=True,
+            )
+            AppHelper.callAfter(self._onTranscriptionDone_, text)
+            print(f"[worker tid={tid}] callAfter scheduled, worker exiting", flush=True)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _onTranscriptionDone_(self, text):
+        self._transcribing = False
+        tid = threading.get_ident()
+        print(
+            f"[done tid={tid}] _onTranscriptionDone_ ENTERED; "
+            f"text={text!r} (len={len(text)}); "
+            f"_visible={self._visible}; _in_ocr={self._in_ocr}; _recording={self._recording}",
+            flush=True,
+        )
+        if self._mic_button is not None:
+            self._mic_button.setEnabled_(True)
+        if not text:
+            print("[done] empty text → 返回", flush=True)
+            return
+        if not self._visible:
+            # 用户在转写期间显式按了 Esc / 提交，悬浮框已被销毁——丢弃结果
+            print("[done] _visible=False → 结果丢弃（用户已显式取消）", flush=True)
+            return
+        current = str(self.text_view.string())
+        print(f"[done] current textview content: {current!r} (len={len(current)})", flush=True)
+        if current:
+            sep = "" if current.endswith("\n") else "\n"
+            new_text = current + sep + text
+        else:
+            new_text = text
+        self.text_view.setString_(new_text)
+        self.text_view.setSelectedRange_(NSMakeRange(len(new_text), 0))
+        self.text_view.setNeedsDisplay_(True)
+        self._resize_to_content()
+        # 转写期间用户可能切到别的 app，悬浮框被推到后面——把它拉回前台并取回焦点
+        NSApp.activateIgnoringOtherApps_(True)
+        self.window.makeKeyAndOrderFront_(None)
+        self.window.makeFirstResponder_(self.text_view)
+        print(f"[done] textview 已更新到 len={len(new_text)}", flush=True)
+
+    def _setMicRecordingVisual_(self, is_recording):
+        if self._mic_button is None:
+            return
+        if is_recording:
+            try:
+                self._mic_button.setContentTintColor_(NSColor.systemRedColor())
+            except Exception:
+                pass
+            if self._mic_icon_recording is not None:
+                self._mic_button.setImage_(self._mic_icon_recording)
+        else:
+            try:
+                self._mic_button.setContentTintColor_(None)
+            except Exception:
+                pass
+            if self._mic_icon_idle is not None:
+                self._mic_button.setImage_(self._mic_icon_idle)
+
     # ---- delegate / observer ----
 
     def windowDidResignKey_(self, _notif):
+        print(
+            f"[focus] windowDidResignKey fired; _in_ocr={self._in_ocr}; "
+            f"_visible={self._visible}; _recording={self._recording}; "
+            f"_transcribing={self._transcribing}",
+            flush=True,
+        )
         if self._in_ocr:
             # OCR 过程中悬浮框被 orderOut 掉了，这次 resignKey 不算用户失焦取消
+            return
+        if self._transcribing:
+            # 转写可能要几十秒（首次还要拉模型），期间用户切到别处不能算取消
+            print("[focus] 转写中，忽略本次失焦", flush=True)
             return
         if self._visible:
             self.hide()
