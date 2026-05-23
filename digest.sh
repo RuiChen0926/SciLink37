@@ -1,9 +1,24 @@
 #!/bin/bash
 
-INBOX=/Users/rui/Projects/SciLink37/inbox.md
+INBOX_DIR=/Users/rui/Projects/SciLink37/inbox
+TODAY=$(date "+%Y-%m-%d")
+DAY_DIR="$INBOX_DIR/$TODAY"
+SCIENCE="$DAY_DIR/science.md"
+RAW="$DAY_DIR/raw.md"
+# 优先用 sort.sh 过滤后的 science 子集；没有就回退到原始 raw
+if [ -f "$SCIENCE" ] && [ -s "$SCIENCE" ]; then
+  INBOX="$SCIENCE"
+  INBOX_REL="inbox/$TODAY/science.md"
+else
+  INBOX="$RAW"
+  INBOX_REL="inbox/$TODAY/raw.md"
+fi
+DIGEST="$DAY_DIR/digest.md"
+DIGEST_REL="inbox/$TODAY/digest.md"
 API="http://localhost:8080/v1/chat/completions"
 HEALTH="http://localhost:8080/v1/models"
 STARTED_BY_US=0
+DIVIDER="─────────────────────────────"
 
 # 退出时若是本脚本启的 Gemma，把它关掉；外部已存在的实例不动
 cleanup() {
@@ -14,11 +29,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if [ ! -f "$INBOX" ] || [ ! -s "$INBOX" ]; then
-  echo "❌ inbox 是空的，先用 capture.sh 记录一些想法。"
+  echo "❌ 今天的 inbox $INBOX_REL 是空的，先用 capture.sh 或悬浮框记录一些想法。"
   exit 0
 fi
 
-echo "🔄 整理中..."
+echo "🔄 整理中 $TODAY ..."
 
 # Gemma 没在跑就静默拉起来；最多等 60s
 if ! curl -s "$HEALTH" >/dev/null 2>&1; then
@@ -29,7 +44,7 @@ if ! curl -s "$HEALTH" >/dev/null 2>&1; then
       break
     fi
     if [ "$i" -eq 60 ]; then
-      echo "❌ Gemma 服务启动超时（60s），请检查 /tmp/secretary.log"
+      echo "❌ Gemma 服务启动超时 [60s]，请检查 /tmp/secretary.log"
       exit 1
     fi
     sleep 1
@@ -43,12 +58,17 @@ if [ -z "$RESPONSE" ]; then
   exit 1
 fi
 
-echo ""
-echo "$RESPONSE"
-echo ""
+# 写入文件：原样保留 prompt 自带的 ## 1./2./3. 标题
+echo "$RESPONSE" > "$DIGEST"
 
-read -p "🗑️  是否清空 inbox？(y/n): " CLEAR
-if [ "$CLEAR" = "y" ]; then
-  > "$INBOX"
-  echo "✅ inbox 已清空。"
-fi
+# 终端显示：去掉 ## 前缀，套上分隔框
+echo ""
+echo "$DIVIDER"
+echo "  $TODAY  SciLink37 Digest"
+echo "$DIVIDER"
+echo ""
+echo "$RESPONSE" | sed -E 's/^##[[:space:]]*//'
+echo ""
+echo "$DIVIDER"
+echo " ✅ 已写入 $DIGEST_REL"
+echo "$DIVIDER"

@@ -112,3 +112,15 @@ Scientific discovery relies on scientists generating novel hypotheses that under
 https://deepmind.google/science/
 Helping power the next century of scientific progress. We take a multidisciplinary approach to connect different fields of scientific study. To support researchers as they work towards new breakthrou…
 
+[2026-05-22 23:33]
+B—扩展输入源 ⑦
+•选中文字 双击 Command 自动填入
+•OCR 框选识别
+•语音输入（mlx-whisper 本地）
+•链接捕获（三层策略）
+• Gemma 按需调用
+待办（下次）
+• 微信公众号质量判断
+。链接摘要最小长度质量评估
+SicLink37 现在作为本地翻译官的输入层已经相当完整了。
+

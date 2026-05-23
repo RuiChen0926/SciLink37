@@ -1,7 +1,22 @@
 #!/bin/bash
 
-echo "🚀 启动 SciLink37..."
+echo "🚀 启动 Gemma 服务器..."
 
-nohup python3 /Users/rui/Projects/SciLink37/floater.py >/tmp/floater.log 2>&1 &
+if curl -s http://localhost:8080/v1/models >/dev/null 2>&1; then
+  echo "✅ Gemma 已在运行（http://localhost:8080）"
+  exit 0
+fi
 
-echo "✅ SciLink37 已启动（floater 常驻；Gemma 在 digest 时按需启动）"
+nohup ~/start_secretary.sh >/tmp/secretary.log 2>&1 &
+
+echo "⏳ 等待 Gemma 就绪（最多 60s）..."
+for i in {1..60}; do
+  if curl -s http://localhost:8080/v1/models >/dev/null 2>&1; then
+    echo "✅ Gemma 已就绪（http://localhost:8080）"
+    exit 0
+  fi
+  sleep 1
+done
+
+echo "❌ Gemma 启动超时，请检查 /tmp/secretary.log"
+exit 1

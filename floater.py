@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Floater: 原生 macOS 悬浮捕获（PyObjC + NSVisualEffectView）。
 双击 Command 触发（任何场景：浏览器、输入框、全屏 app 都可）。
-Enter 保存到 inbox.md，Esc / 失焦取消。
+Enter 保存到 inbox/YYYY-MM-DD.md（按当天日期），Esc / 失焦取消。
 悬浮框右下角有「框选文字」按钮：点击后整屏覆盖半透明遮罩，
 拖拽选区，松手后用 macOS Vision (VNRecognizeTextRequest) 做 OCR，
 识别结果自动回填到输入框，用户确认后再 Enter 入库。
 全局热键基于 CGEventTap (kCGSessionEventTap + kCGHeadInsertEventTap)，
 监听 flagsChanged 检测 Command 的「干净双击」——两次按下间隔 < 0.4s，且中间没有其他键。"""
 import os
+os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + os.environ.get("PATH", "")
 import subprocess
 import tempfile
 import threading
@@ -128,14 +129,19 @@ except Exception as _exc:  # noqa: BLE001
     print(f"[floater] URL 抓取依赖缺失: {_exc}（pip install requests beautifulsoup4）", flush=True)
 
 
-INBOX = Path("/Users/rui/Projects/SciLink37/inbox.md")
+INBOX_DIR = Path("/Users/rui/Projects/SciLink37/inbox")
+
+
+def today_inbox_path() -> Path:
+    """每次调用都基于当下日期计算路径，跨天后自动切换到新文件夹。"""
+    return INBOX_DIR / datetime.now().strftime("%Y-%m-%d") / "raw.md"
 WIDTH = 400.0
 MIN_HEIGHT = 56.0
 MAX_HEIGHT = 320.0
 PAD = 14.0
 CORNER = 12.0
 FONT_SIZE = 15.0
-PLACEHOLDER = "记录想法..."
+PLACEHOLDER = "Fact Recording...   ! 直觉  ? 卡点  → 记录"
 FADE_DURATION = 0.12
 DOUBLE_TAP_INTERVAL = 0.4  # seconds, press-to-press
 OCR_BTN_SIZE = 20.0
@@ -1116,9 +1122,10 @@ class FloaterController(NSObject):
     def submit(self):
         text = str(self.text_view.string()).strip()
         if text:
-            INBOX.parent.mkdir(parents=True, exist_ok=True)
+            inbox = today_inbox_path()
+            inbox.parent.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-            with INBOX.open("a", encoding="utf-8") as f:
+            with inbox.open("a", encoding="utf-8") as f:
                 f.write(f"[{timestamp}]\n{text}\n\n")
         self.hide()
 
@@ -1460,7 +1467,7 @@ def main():
         print("   （Terminal / iTerm2 / VS Code 等）打勾后，重新启动这个脚本。")
         return
 
-    print(f"✅ floater 已启动，双击 Command 唤起。inbox: {INBOX}")
+    print(f"✅ floater 已启动，双击 Command 唤起。inbox: {INBOX_DIR}/YYYY-MM-DD/raw.md")
 
     AppHelper.runEventLoop()
 
