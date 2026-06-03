@@ -109,6 +109,31 @@ Claude Code 在调用 `digest_helper.py` 前，**必须确认服务器已启动*
 
 ---
 
+## 模型选型
+
+`config.sh` 注册了两个本地模型，用环境变量 `MODEL` 切换（默认 2B）：
+
+| MODEL | 模型字符串 | 适合任务 | 不适合任务 |
+|------|------|---------|-----------|
+| `2b`（默认） | `mlx-community/gemma-4-e2b-it-4bit` | sort / digest | — |
+| `26b` | `mlx-community/gemma-4-26b-a4b-it-4bit`（MoE：26B 总参 / 4B 激活） | collect（推理质量超过 2B） | sort / digest（不按格式输出） |
+
+**实测结论**（2026-06-03）：26B 在结构化输出任务上不可用——sort 不出 JSON、digest 不出 `## 1./## 2./## 3.` 三段式，token 全花在 thinking / 自我对话上。collect 是自由文本任务（分组 + 总结），结构柔性大，26B 的推理优势能体现，且按格式输出。
+
+**各任务默认模型**
+
+| 脚本 | 默认 MODEL | 覆盖方法 |
+|------|-----------|---------|
+| `./sort.sh` | `2b` | 不建议覆盖（26B 不出 JSON） |
+| `./digest.sh` | `2b` | 不建议覆盖（26B 不出三段式） |
+| `./collect.sh` | `26b`（`MODEL_DEFAULT_COLLECT`） | `MODEL=2b ./collect.sh` 降级 |
+
+默认值在 `config.sh` 的 `MODEL_DEFAULT_*` 常量里。
+
+**机制**：`mlx_lm.server` 是 lazy-load 多模型——只要本地缓存有，请求里写哪个模型字段就现场加载哪个。`~/start_secretary.sh` 的 `MODEL` 只控制启动时**预热**哪个，不限制后续切换；三个 pipeline 脚本会在请求前校验 `SELECTED_MODEL` 是否在本地缓存里。
+
+---
+
 ## 开发约定
 
 **做什么**

@@ -5,6 +5,7 @@ from urllib.parse import urlparse
 
 inbox_path = sys.argv[1]
 api = sys.argv[2]
+model = sys.argv[3]
 
 with open(inbox_path, "r") as f:
     inbox_content = f.read()
@@ -36,7 +37,7 @@ system_prompt = """你是一个灵感整理助手。只做整理，不做评价�
 ..."""
 
 payload = {
-    "model": "mlx-community/gemma-4-e2b-it-4bit",
+    "model": model,
     "messages": [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": "以下是今天的灵感碎片，请按上面的格式整理：\n\n" + inbox_content}

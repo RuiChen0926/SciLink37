@@ -1,7 +1,13 @@
 #!/bin/bash
 
+source /Users/rui/Projects/SciLink37/config.sh
+case "${MODEL:-2b}" in
+  26b) SELECTED_MODEL="$MODEL_26B" ;;
+  *)   SELECTED_MODEL="$MODEL_2B" ;;
+esac
+
 INBOX_DIR=/Users/rui/Projects/SciLink37/inbox
-TODAY=$(date "+%Y-%m-%d")
+TODAY="${1:-$(date "+%Y-%m-%d")}"
 DAY_DIR="$INBOX_DIR/$TODAY"
 SCIENCE="$DAY_DIR/science.md"
 RAW="$DAY_DIR/raw.md"
@@ -51,7 +57,15 @@ if ! curl -s "$HEALTH" >/dev/null 2>&1; then
   done
 fi
 
-RESPONSE=$(python3 /Users/rui/Projects/SciLink37/digest_helper.py "$INBOX" "$API")
+AVAILABLE=$(curl -s "$HEALTH" | python3 -c "import sys, json; print('\n'.join(m['id'] for m in json.load(sys.stdin)['data']))" 2>/dev/null)
+if ! echo "$AVAILABLE" | grep -Fxq "$SELECTED_MODEL"; then
+  echo "❌ 本地未缓存模型 $SELECTED_MODEL"
+  echo "   服务器可用模型："
+  echo "$AVAILABLE" | sed 's/^/     /'
+  exit 1
+fi
+
+RESPONSE=$(python3 /Users/rui/Projects/SciLink37/digest_helper.py "$INBOX" "$API" "$SELECTED_MODEL")
 
 if [ -z "$RESPONSE" ]; then
   echo "❌ 本地 AI 没有响应。"

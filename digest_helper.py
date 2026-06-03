@@ -5,6 +5,7 @@ from urllib.parse import urlparse
 
 inbox_path = sys.argv[1]
 api = sys.argv[2]
+model = sys.argv[3]
 
 with open(inbox_path, "r") as f:
     inbox_content = f.read()
@@ -46,7 +47,7 @@ system_prompt = """你是 SciLink37 的本地翻译官。
 碎片不足——请补充：你现在卡在哪里？今天想推进什么？"""
 
 payload = {
-    "model": "mlx-community/gemma-4-e2b-it-4bit",
+    "model": model,
     "messages": [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": "以下是我最近记录的研究碎片，请整理：\n\n" + inbox_content}
