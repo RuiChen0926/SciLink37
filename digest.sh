@@ -19,8 +19,8 @@ else
   INBOX="$RAW"
   INBOX_REL="inbox/$TODAY/raw.md"
 fi
-DIGEST="$DAY_DIR/digest.md"
-DIGEST_REL="inbox/$TODAY/digest.md"
+DIGEST="$DAY_DIR/prompt.md"
+DIGEST_REL="inbox/$TODAY/prompt.md"
 API="http://localhost:8080/v1/chat/completions"
 HEALTH="http://localhost:8080/v1/models"
 STARTED_BY_US=0
@@ -78,7 +78,7 @@ echo "$RESPONSE" > "$DIGEST"
 # 终端显示：去掉 ## 前缀，套上分隔框
 echo ""
 echo "$DIVIDER"
-echo "  $TODAY  SciLink37 Digest"
+echo "  $TODAY  SciLink37 Prompt"
 echo "$DIVIDER"
 echo ""
 echo "$RESPONSE" | sed -E 's/^##[[:space:]]*//'

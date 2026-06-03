@@ -75,6 +75,8 @@ from PyObjCTools import AppHelper
 from Quartz import (
     CGEventCreateKeyboardEvent,
     CGEventGetFlags,
+    CGEventGetIntegerValueField,
+    CGEventSetIntegerValueField,
     CGEventMaskBit,
     CGEventPost,
     CGEventSetFlags,
@@ -85,6 +87,7 @@ from Quartz import (
     kCGEventFlagMaskCommand,
     kCGEventFlagsChanged,
     kCGEventKeyDown,
+    kCGEventSourceUserData,
     kCGEventTapDisabledByTimeout,
     kCGEventTapOptionListenOnly,
     kCGHIDEventTap,
@@ -144,6 +147,11 @@ FONT_SIZE = 15.0
 PLACEHOLDER = "Fact Recording...   ! 直觉  ? 卡点  → 记录"
 FADE_DURATION = 0.12
 DOUBLE_TAP_INTERVAL = 0.4  # seconds, press-to-press
+TRIPLE_TAP_WINDOW = 1.0    # 三击 Command 的总窗口（首拍到第三拍 < 1s）触发 Dashboard
+DASHBOARD_URL = "http://localhost:8037"
+# 给自己合成的 Cmd+C 事件打的标记（kCGEventSourceUserData）；事件 tap 见到它就跳过，
+# 否则双击弹窗时合成的 Cmd+C 会被当成「其他键」清空三击序列，导致三击永远凑不齐。
+SYNTHETIC_EVENT_TAG = 0x5C137
 OCR_BTN_SIZE = 20.0
 OCR_BTN_MARGIN = 6.0
 MIC_BTN_SIZE = 20.0
@@ -1074,9 +1082,12 @@ class FloaterController(NSObject):
             return
         CGEventSetFlags(ev_down, kCGEventFlagMaskCommand)
         CGEventSetFlags(ev_up, kCGEventFlagMaskCommand)
+        # 打标记：让全局事件 tap 认出这是「自己发的」Cmd+C，不要拿它清空三击序列
+        CGEventSetIntegerValueField(ev_down, kCGEventSourceUserData, SYNTHETIC_EVENT_TAG)
+        CGEventSetIntegerValueField(ev_up, kCGEventSourceUserData, SYNTHETIC_EVENT_TAG)
         CGEventPost(kCGHIDEventTap, ev_down)
         CGEventPost(kCGHIDEventTap, ev_up)
-        print("[floater] sent synthetic Cmd+C via kCGHIDEventTap", flush=True)
+        print("[floater] sent synthetic Cmd+C via kCGHIDEventTap (tagged)", flush=True)
 
     def _read_clipboard_text(self, old_count):
         pb = NSPasteboard.generalPasteboard()
@@ -1092,12 +1103,6 @@ class FloaterController(NSObject):
     def hide(self):
         if not self._visible:
             return
-        import traceback
-        print(
-            f"[hide] called; _recording={self._recording}; _in_ocr={self._in_ocr}",
-            flush=True,
-        )
-        traceback.print_stack(limit=6)
         # 录音中被取消：丢弃缓冲，不走转写
         if self._recording:
             try:
@@ -1131,6 +1136,21 @@ class FloaterController(NSObject):
 
     def cancel(self):
         self.hide()
+
+    def open_dashboard(self):
+        """三击 Command：唤起本地 Web Dashboard。若悬浮框正显示（双击已弹出），先收起再开浏览器。"""
+        print(f"[dashboard] 三击 Command → 打开 {DASHBOARD_URL}", flush=True)
+        if self._visible:
+            self.hide()
+        try:
+            subprocess.Popen(
+                ["open", DASHBOARD_URL],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[dashboard] open 失败: {exc!r}", flush=True)
 
     # ---- OCR 流程 ----
 
@@ -1365,20 +1385,26 @@ class FloaterController(NSObject):
 
 
 class DoubleCommandDetector:
-    """识别「干净的 Command 双击」：
+    """识别「干净的 Command 双击 / 三击」：
 
     - 「按下」用 flagsChanged 上 Command flag 由 0→1 的瞬间识别。
     - 「干净」= 这次 Command 按住期间没有任何 keyDown（即不是 Cmd+S / Cmd+Tab 这类组合键）。
-    - 「双击」= 两次干净按下的时间差 < DOUBLE_TAP_INTERVAL（press-to-press，跟第二次按住多久无关）。
-    - 中间出现任何 keyDown 都把上一次按下作废（用户在打字途中 Cmd 拍一下不应算第一拍）。
+    - 「双击」= 两次干净按下的时间差 < DOUBLE_TAP_INTERVAL（press-to-press）→ 唤起悬浮框。
+    - 「三击」= 1 秒内三次干净按下（TRIPLE_TAP_WINDOW）→ 打开 Web Dashboard。
+    - 中间出现任何 keyDown 都把累积的按下序列作废（打字途中 Cmd 拍一下不应算进来）。
+
+    双击仍然在第二拍就「零延迟」触发悬浮框；若紧接着第三拍落在 1 秒窗口内，会再升级成
+    三击触发 Dashboard（open_dashboard 会先把刚弹出的悬浮框收起）。这样常用的双击捕获
+    手感不变，三击只是它的罕见叠加态。
     """
 
-    def __init__(self, on_trigger):
+    def __init__(self, on_trigger, on_triple=None):
         self._on_trigger = on_trigger
+        self._on_triple = on_triple
         self._cmd_held = False
         self._dirty = False               # 当前 Cmd 按住期间是否出现过其他键
         self._cmd_press_time = None       # 当前 Cmd 按下的时刻
-        self._last_clean_press_time = None  # 上一次干净 Cmd 按下的时刻
+        self._press_times = []            # 近期干净 Cmd 按下时刻（裁剪到 1 秒窗口内）
 
     def handle_flags_changed(self, cmd_now_held, now):
         if cmd_now_held and not self._cmd_held:
@@ -1390,22 +1416,32 @@ class DoubleCommandDetector:
             press_time = self._cmd_press_time
             self._cmd_press_time = None
             if self._dirty:
-                # Cmd 当过修饰键，不算 tap，并把窗口清掉
-                self._last_clean_press_time = None
+                # Cmd 当过修饰键，不算 tap，并把序列清掉
+                self._press_times = []
                 return
-            if (self._last_clean_press_time is not None
-                    and (press_time - self._last_clean_press_time) < DOUBLE_TAP_INTERVAL):
-                self._last_clean_press_time = None
-                self._on_trigger()
-            else:
-                self._last_clean_press_time = press_time
+            self._register_clean_press(press_time)
+
+    def _register_clean_press(self, t):
+        # 只保留 1 秒窗口内的干净按下
+        self._press_times = [p for p in self._press_times if (t - p) < TRIPLE_TAP_WINDOW]
+        self._press_times.append(t)
+        if len(self._press_times) >= 3:
+            # 三击：1 秒内三次干净 Command → Dashboard，并清空序列
+            self._press_times = []
+            if self._on_triple is not None:
+                self._on_triple()
+            return
+        if (len(self._press_times) == 2
+                and (self._press_times[1] - self._press_times[0]) < DOUBLE_TAP_INTERVAL):
+            # 双击：立刻触发悬浮框（保持零延迟）。不清空序列——若第三拍仍在 1 秒内会升级成三击。
+            self._on_trigger()
 
     def handle_other_key(self):
         if self._cmd_held:
             self._dirty = True
-        # 即便 Cmd 没按住，任何其他键的 keyDown 也作废上一次 tap——
+        # 即便 Cmd 没按住，任何其他键的 keyDown 也作废累积序列——
         # 否则「Cmd-拍、打字、Cmd-拍」会被误判为双击。
-        self._last_clean_press_time = None
+        self._press_times = []
 
 
 class GlobalTrigger:
@@ -1420,6 +1456,7 @@ class GlobalTrigger:
         self._source = None
         self._detector = DoubleCommandDetector(
             on_trigger=lambda: AppHelper.callAfter(controller.show),
+            on_triple=lambda: AppHelper.callAfter(controller.open_dashboard),
         )
 
     def _on_event(self, proxy, event_type, cgevent, refcon):
@@ -1427,6 +1464,9 @@ class GlobalTrigger:
         if event_type == kCGEventTapDisabledByTimeout:
             if self._tap is not None:
                 CGEventTapEnable(self._tap, True)
+            return cgevent
+        # 跳过自己合成的 Cmd+C：否则双击弹窗时它会被当成「其他键」清空三击序列
+        if CGEventGetIntegerValueField(cgevent, kCGEventSourceUserData) == SYNTHETIC_EVENT_TAG:
             return cgevent
         now = time.monotonic()
         if event_type == kCGEventFlagsChanged:
@@ -1467,7 +1507,8 @@ def main():
         print("   （Terminal / iTerm2 / VS Code 等）打勾后，重新启动这个脚本。")
         return
 
-    print(f"✅ floater 已启动，双击 Command 唤起。inbox: {INBOX_DIR}/YYYY-MM-DD/raw.md")
+    print(f"✅ floater 已启动，双击 Command 唤起悬浮框；三击 Command 打开 {DASHBOARD_URL}。")
+    print(f"   inbox: {INBOX_DIR}/YYYY-MM-DD/raw.md")
 
     AppHelper.runEventLoop()
 

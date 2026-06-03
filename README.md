@@ -36,8 +36,8 @@ Fact Recording...   ! 直觉  ? 卡点  → 记录
 
 ```bash
 ./sort.sh       # 分类：Science / Nature / Noise
-./digest.sh     # Science → 三段式研究指令
-./collect.sh    # Nature → 分组归档 + 今日总结
+./digest.sh     # Science → 三段式研究指令（写 prompt.md）
+./collect.sh    # Science + Nature → 分组归档 + 今日总结（写 inspiration.md）
 ```
 
 ### 按需启动 Gemma
@@ -62,8 +62,9 @@ inbox/YYYY-MM-DD/raw.md
     └── noise         → 直接丢弃
     ↓
 ./digest.sh                    ./collect.sh
+（读 science）                 （读 science + nature）
     ↓                              ↓
-digest.md                      collect.md
+prompt.md                      inspiration.md
 （给 Antigravity 的指令）       （分组归档）
 ```
 
@@ -73,7 +74,7 @@ digest.md                      collect.md
 
 ```
 ─────────────────────────────
-  YYYY-MM-DD  SciLink37 Digest
+  YYYY-MM-DD  SciLink37 Prompt
 ─────────────────────────────
 
 1. 初始场
@@ -86,7 +87,7 @@ digest.md                      collect.md
 一句话，动词开头，具体到文件或函数级别
 
 ─────────────────────────────
-  ✅ 已写入 inbox/YYYY-MM-DD/digest.md
+  ✅ 已写入 inbox/YYYY-MM-DD/prompt.md
 ─────────────────────────────
 ```
 
@@ -111,8 +112,8 @@ SciLink37/
         ├── raw.md          # 原始记录（不动）
         ├── science.md      # 研究主线碎片
         ├── nature.md       # 灵感外部信息
-        ├── digest.md       # 研究指令输出
-        └── collect.md      # 灵感归档输出
+        ├── prompt.md       # 研究指令输出（digest.sh）
+        └── inspiration.md  # 灵感归档输出（collect.sh，读 science + nature）
 ```
 
 ---

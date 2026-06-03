@@ -3,12 +3,33 @@ import json
 from http.client import HTTPConnection
 from urllib.parse import urlparse
 
-inbox_path = sys.argv[1]
-api = sys.argv[2]
-model = sys.argv[3]
+science_path = sys.argv[1]
+nature_path = sys.argv[2]
+api = sys.argv[3]
+model = sys.argv[4]
 
-with open(inbox_path, "r") as f:
-    inbox_content = f.read()
+
+def _read(path):
+    try:
+        with open(path, "r") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+
+# 合并 science.md + nature.md：科研条目和灵感条目一起送进来整理
+_sections = []
+science_content = _read(science_path)
+if science_content:
+    _sections.append("【科研】\n" + science_content)
+nature_content = _read(nature_path)
+if nature_content:
+    _sections.append("【灵感】\n" + nature_content)
+inbox_content = "\n\n".join(_sections)
+
+if not inbox_content:
+    sys.stderr.write("science.md 与 nature.md 都是空的，没有可整理的内容。\n")
+    sys.exit(1)
 
 system_prompt = """你是一个灵感整理助手。只做整理，不做评价，不做建议。
 
@@ -40,7 +61,7 @@ payload = {
     "model": model,
     "messages": [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": "以下是今天的灵感碎片，请按上面的格式整理：\n\n" + inbox_content}
+        {"role": "user", "content": "以下是今天的科研笔记与灵感碎片，请按上面的格式整理：\n\n" + inbox_content}
     ],
     "temperature": 0.3,
     "max_tokens": 4000

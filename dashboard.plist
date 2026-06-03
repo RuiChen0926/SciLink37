@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.scilink37.dashboard</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/rui/miniconda3/bin/python3</string>
+        <string>/Users/rui/Projects/SciLink37/dashboard.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/rui/Projects/SciLink37</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/dashboard.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/dashboard.log</string>
+</dict>
+</plist>

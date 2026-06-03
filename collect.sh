@@ -9,25 +9,24 @@ esac
 INBOX_DIR=/Users/rui/Projects/SciLink37/inbox
 TODAY="${1:-$(date "+%Y-%m-%d")}"
 DAY_DIR="$INBOX_DIR/$TODAY"
-INBOX="$DAY_DIR/nature.md"
-INBOX_REL="inbox/$TODAY/nature.md"
-COLLECT="$DAY_DIR/collect.md"
-COLLECT_REL="inbox/$TODAY/collect.md"
+SCIENCE="$DAY_DIR/science.md"
+NATURE="$DAY_DIR/nature.md"
+INSPIRATION="$DAY_DIR/inspiration.md"
+INSPIRATION_REL="inbox/$TODAY/inspiration.md"
 API="http://localhost:8080/v1/chat/completions"
 HEALTH="http://localhost:8080/v1/models"
 STARTED_BY_US=0
 DIVIDER="─────────────────────────────"
 
-# 退出时若是本脚本启的 Gemma，把它关掉；外部已存在的实例不动
+# collect 是 pipeline 末端，用完即释放：无论是否本脚本启的，结束都关掉 Gemma
 cleanup() {
-  if [ "$STARTED_BY_US" -eq 1 ]; then
-    pkill -f "mlx_lm.server" 2>/dev/null
-  fi
+  pkill -f "mlx_lm.server" 2>/dev/null
 }
 trap cleanup EXIT INT TERM
 
-if [ ! -f "$INBOX" ] || [ ! -s "$INBOX" ]; then
-  echo "❌ 今天的 nature $INBOX_REL 是空的，先用 sort.sh 分类。"
+# science 与 nature 至少要有一个非空，否则没东西可整理
+if { [ ! -f "$SCIENCE" ] || [ ! -s "$SCIENCE" ]; } && { [ ! -f "$NATURE" ] || [ ! -s "$NATURE" ]; }; then
+  echo "❌ 今天的 science / nature 都是空的，先用 sort.sh 分类。"
   exit 0
 fi
 
@@ -57,23 +56,23 @@ if ! echo "$AVAILABLE" | grep -Fxq "$SELECTED_MODEL"; then
   exit 1
 fi
 
-RESPONSE=$(python3 /Users/rui/Projects/SciLink37/collect_helper.py "$INBOX" "$API" "$SELECTED_MODEL")
+RESPONSE=$(python3 /Users/rui/Projects/SciLink37/collect_helper.py "$SCIENCE" "$NATURE" "$API" "$SELECTED_MODEL")
 
 if [ -z "$RESPONSE" ]; then
   echo "❌ 本地 AI 没有响应。"
   exit 1
 fi
 
-echo "$RESPONSE" > "$COLLECT"
+echo "$RESPONSE" > "$INSPIRATION"
 
 # 终端显示：套上分隔框
 echo ""
 echo "$DIVIDER"
-echo "  $TODAY  SciLink37 Collect"
+echo "  $TODAY  SciLink37 Inspiration"
 echo "$DIVIDER"
 echo ""
 echo "$RESPONSE"
 echo ""
 echo "$DIVIDER"
-echo " ✅ 已写入 $COLLECT_REL"
+echo " ✅ 已写入 $INSPIRATION_REL"
 echo "$DIVIDER"
