@@ -32,6 +32,14 @@ Fact Recording...   ! 直觉  ? 卡点  → 记录
 
 支持五种输入方式：手打、选中文字自动预填、URL 抓取标题摘要、OCR 框选、语音输入。
 
+### 查看与操作
+
+三击 Command 唤起 Dashboard，浏览器打开 http://localhost:8037：
+
+- 切换日期，查看 raw / science / nature / prompt / inspiration
+- 点击 Sort / Digest / Collect 直接触发 pipeline
+- Edit 模式可直接编辑 MD 文件，失焦自动保存
+
 ### 整理与消化
 
 ```bash
@@ -98,15 +106,20 @@ prompt.md                      inspiration.md
 ```
 SciLink37/
 ├── floater.py              # 悬浮捕获窗口（开机常驻）
+├── dashboard.py            # 本地 Web 面板（开机常驻，端口 8037）
+├── dashboard.plist         # Dashboard LaunchAgent
 ├── sort.sh                 # 分类脚本
 ├── sort_helper.py          # 分类逻辑（调用 Gemma）
 ├── digest.sh               # 研究整理脚本
 ├── digest_helper.py        # 翻译逻辑（调用 Gemma）
 ├── collect.sh              # 灵感归档脚本
 ├── collect_helper.py       # 归档逻辑（调用 Gemma）
+├── config.sh               # 模型配置（MODEL_2B / MODEL_26B）
 ├── start.sh                # 启动 Gemma
 ├── stop.sh                 # 关闭 Gemma
 ├── disable.sh              # 彻底禁用 floater 自启动
+├── static/
+│   └── marked.min.js       # 离线 MD 渲染
 └── inbox/
     └── YYYY-MM-DD/
         ├── raw.md          # 原始记录（不动）
@@ -139,6 +152,8 @@ SciLink37/
 - **OCR**：macOS Vision Framework（VNRecognizeTextRequest）
 - **分类 / 翻译**：Gemma 4 E2B（mlx-community/gemma-4-e2b-it-4bit），本地 MLX 推理
 - **自启动**：macOS LaunchAgent
+- **Dashboard**：Flask 本地服务（端口 8037），三击 Command 唤起，
+  支持日期切换、五 Tab 查看、Edit/Read 编辑模式、pipeline 触发按钮
 
 本地运行，数据不出门，零云端依赖。
 
