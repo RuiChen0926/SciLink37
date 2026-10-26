@@ -79,7 +79,7 @@ noise_entries = []
 
 # 第 2 步：剩下的交给 Gemma 三分类（分批，避免单次 thinking 撑爆 max_tokens）
 if to_gemma_texts:
-    system_prompt = """你是一个分类器。研究者背景：计算物理博士，做 AlphaStorm 项目，研究热带气旋（TC）和宇宙普适框架（旋转、耗散、自组织）。
+    system_prompt = """你是一个分类器。研究者背景：计算机科学与技术博士，具有大气物理与物理海洋学背景，做 AlphaStorm 项目，研究热带气旋（TC）和宇宙普适框架（旋转、耗散、自组织）。
 
 把每一条碎片分为三类：
 - science：与 TC、AlphaStorm、无量纲框架、Universe Storm、物理直觉、数值方法、Alpha 系列方法论直接相关；
